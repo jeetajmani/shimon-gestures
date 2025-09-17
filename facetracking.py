@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+from pythonosc import udp_client
 
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(
@@ -13,9 +14,16 @@ drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
 
 cap = cv2.VideoCapture(0)
 
+def send_to_shimon(angle, host="192.168.1.1", port=9000):
+    client = udp_client.SimpleUDPClient(host, port)
+
+    client.send_message(f"/head-commands", ["NECK", angle, 6])
+
 if not cap.isOpened():
     print("Error: Could not open video stream.")
     exit()
+
+prev_face_is_looking = None  # track last state
 
 # Run the face tracking loop
 while cap.isOpened():
@@ -46,12 +54,10 @@ while cap.isOpened():
             dist_left = abs(nose_tip.x - left_cheek.x)
             dist_right = abs(nose_tip.x - right_cheek.x)
             ratio = dist_left / dist_right if dist_right != 0 else 0
-
             yaw_ok = 0.7 < ratio < 1.3   # tweak threshold if needed
 
             # PITCH CHECK (up/down tilt)
             vertical_ratio = (nose_tip.y - forehead.y) / (chin.y - nose_tip.y)
-
             pitch_ok = 0.85 < vertical_ratio < 1.4   # tweak threshold if needed
 
             if yaw_ok and pitch_ok:
@@ -65,7 +71,18 @@ while cap.isOpened():
                 connection_drawing_spec=drawing_spec
             )
 
-    # Check if face is looking
+    # Detect state change and print message
+    if prev_face_is_looking is not None and face_is_looking != prev_face_is_looking:
+        if face_is_looking:
+            print(">>> Changed: Now LOOKING at camera")
+            send_to_shimon(0.1)
+        else:
+            print(">>> Changed: Now NOT LOOKING at camera")
+            send_to_shimon(-0.5)
+
+    prev_face_is_looking = face_is_looking  # update state
+
+    # Show current state overlay
     if face_is_looking:
         cv2.putText(image, "Looking at camera", (50, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
