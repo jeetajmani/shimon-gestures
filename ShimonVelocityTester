@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import csv
+import copy
+import argparse
+import itertools
+import threading
+import time
+import math
+from collections import Counter, deque
+
+import cv2 as cv
+import numpy as np
+import mediapipe as mp
+from pythonosc import udp_client
+
+# ===================== OSC / Music endpoints =====================
+HOST = "192.168.1.1"     # <— set your robot IP
+MUSIC_PORT = 9010        # /arm endpoint as in your example
+OSC_ARM_PATH = "/arm"    # sends [midi_note, velocity]
+
+# Playback tempo & dynamics
+BPM_DEFAULT = 120.0
+VEL_MIN = 30
+VEL_MAX = 120
+DYNAMICS_SEND_EVERY = 0.25
+DYNAMICS_SMOOTH = 0.2
+
+# ===================== Hand indices & helpers =====================
+WRIST = 0
+TH_MCP, TH_IP, TH_TIP = 2, 3, 4
+IX_MCP, IX_PIP, IX_DIP, IX_TIP = 5, 6, 7, 8
+MI_MCP, MI_PIP, MI_DIP, MI_TIP = 9, 10, 11, 12
+RI_MCP, RI_PIP, RI_DIP, RI_TIP = 13, 14, 15, 16
+PI_MCP, PI_PIP, PI_DIP, PI_TIP = 17, 18, 19, 20
+
+# If your point-history labels differ, edit these substring checks:
+def is_spin_cw(label: str) -> bool:
+    t = label.strip().lower()
+    return ("clockwise" in t) or ("cw" == t) or (" cw" in t) or (t.endswith(" cw"))
+
+def is_spin_ccw(label: str) -> bool:
+    t = label.strip().lower()
+    return ("counterclockwise" in t) or ("counter clockwise" in t) or ("ccw" == t) or (" ccw" in t) or (t.endswith(" ccw"))
+
+# ===================== Music player (ALL CHORDS) =====================
+# Modes (all triads):
+#  - "chord_cmaj" : C E G
+#  - "chord_cmin" : C Eb G
+#  - "chord_gmaj" : G B D
+#  - "chord_caug" : C E G#
+#  - "chord_cdim" : C Eb Gb
+#  - "stopped"    : paused
+class MusicPlayer:
+    def __init__(self, host=HOST, port=MUSIC_PORT, path=OSC_ARM_PATH,
+                 bpm=BPM_DEFAULT, velocity=80):
+        self.client = udp_client.SimpleUDPClient(host, port)
+        self.path = path
+        self._bpm = float(bpm)
+        self._vel = int(velocity)
+        self._mode = "chord_cmaj"
+        self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        # after STOP, first generic resume goes to C-major once (kept for completeness)
+        self._resume_to_cmaj_next = False
+
+        self._thr = threading.Thread(target=self._loop, daemon=True)
+        self._thr.start()
+
+    # ---------- control ----------
+    def set_mode(self, mode: str):
+        with self._lock:
+            if mode not in ("chord_cmaj", "chord_cmin", "chord_gmaj", "chord_caug", "chord_cdim", "stopped"):
+                return
+            if mode != self._mode:
+                print(f"[Player] mode -> {mode}")
+            self._mode = mode
+
+    def pause(self):
+        with self._lock:
+            self._mode = "stopped"
+            self._resume_to_cmaj_next = True
+            print("[Player] STOP]")
+
+    def resume(self):
+        with self._lock:
+            if self._mode == "stopped":
+                if self._resume_to_cmaj_next:
+                    self._mode = "chord_cmaj"
+                    self._resume_to_cmaj_next = False
+                    print("[Player] RESUME → chord_cmaj (one-shot)")
+                else:
+                    self._mode = "chord_cmaj"
+                    print("[Player] RESUME → chord_cmaj")
+
+    def set_velocity(self, velocity: int):
+        velocity = int(max(0, min(127, velocity)))
+        with self._lock:
+            self._vel = velocity
+
+    def set_bpm(self, bpm: float):
+        with self._lock:
+            self._bpm = max(30.0, min(300.0, float(bpm)))
+
+    # ---------- chord helpers ----------
+    @staticmethod
+    def _notes_for_mode(mode: str):
+        if mode == "chord_cmaj":  # C E G
+            return [60, 64, 67]
+        if mode == "chord_cmin":  # C Eb G
+            return [60, 63, 67]
+        if mode == "chord_gmaj":  # G B D
+            return [67, 71, 74]
+        if mode == "chord_caug":  # C E G#
+            return [60, 64, 68]
+        if mode == "chord_cdim":  # C Eb Gb
+            return [60, 63, 66]
+        return []
+
+    def _play_chord(self, notes, velocity, strum_ms=15):
+        """Send the notes of a chord with tiny gaps to emulate a 'simultaneous' strike."""
+        for i, n in enumerate(notes):
+            self._strike(n, velocity)
+            if i < len(notes) - 1:
+                time.sleep(max(0.0, strum_ms / 1000.0))
+
+    # ---------- worker ----------
+    def _loop(self):
+        while not self._stop_evt.is_set():
+            with self._lock:
+                mode = self._mode
+                bpm  = self._bpm
+                vel  = self._vel
+                notes = self._notes_for_mode(mode)
+
+            beat = 60.0 / bpm
+
+            if mode == "stopped":
+                time.sleep(0.05)
+                continue
+
+            if not notes:
+                time.sleep(0.05)
+                continue
+
+            # Play the triad each beat
+            self._play_chord(notes, vel, strum_ms=15)
+            time.sleep(beat)
+
+        print("[Player] stopped thread")
+
+    def _strike(self, midi_note: int, velocity: int):
+        try:
+            self.client.send_message(self.path, [int(midi_note), int(velocity)])
+        except Exception as e:
+            print("[OSC ERROR]", e)
+
+    def shutdown(self):
+        self._stop_evt.set()
+        if self._thr.is_alive():
+            self._thr.join(timeout=1.0)
+
+# ===================== Geometry / gesture utilities =====================
+def _scale_from_points(pts):
+    x, y, w, h = cv.boundingRect(pts.astype(np.int32))
+    return (w**2 + h**2) ** 0.5 + 1e-6
+
+def _pip_angle(pts, mcp, pip, dip):
+    v1 = pts[mcp] - pts[pip]
+    v2 = pts[dip] - pts[pip]
+    a = np.linalg.norm(v1); b = np.linalg.norm(v2)
+    if a == 0 or b == 0: return 180.0
+    cosang = np.clip(np.dot(v1, v2) / (a*b), -1.0, 1.0)
+    return math.degrees(math.acos(cosang))
+
+def _curl_score(pts, mcp, pip, dip):
+    ang = _pip_angle(pts, mcp, pip, dip)
+    return float(np.clip((180.0 - ang) / 120.0, 0.0, 1.0))
+
+def _others_mostly_folded(pts, tol=0.45):
+    curls = [
+        _curl_score(pts, IX_MCP, IX_PIP, IX_DIP),
+        _curl_score(pts, MI_MCP, MI_PIP, MI_DIP),
+        _curl_score(pts, RI_MCP, RI_PIP, RI_DIP),
+        _curl_score(pts, PI_MCP, PI_PIP, PI_DIP),
+    ]
+    return (sum(c >= tol for c in curls) >= 3) and (np.mean(curls) >= (tol - 0.05))
+
+def _thumb_extended_and_dir(pts):
+    v1 = pts[TH_MCP] - pts[TH_IP]
+    v2 = pts[TH_TIP] - pts[TH_IP]
+    a = np.linalg.norm(v1); b = np.linalg.norm(v2)
+    ang = 180.0 if a == 0 or b == 0 else math.degrees(
+        math.acos(np.clip(np.dot(v1, v2)/(a*b), -1.0, 1.0)))
+    dir_vec = pts[TH_TIP] - pts[TH_MCP]
+    n = np.linalg.norm(dir_vec)
+    dir_vec = dir_vec / n if n > 0 else np.array([0.0, 0.0])
+    upness = -dir_vec[1]  # +1 up, -1 down
+    return (ang > 150.0, upness, dir_vec)
+
+def is_thumbs_up(landmark_list_xy):
+    pts = np.asarray(landmark_list_xy, dtype=np.float32)
+    s = _scale_from_points(pts)
+    if not _others_mostly_folded(pts, tol=0.45):
+        return False
+    th_ext, upness, dir_vec = _thumb_extended_and_dir(pts)
+    if not th_ext:
+        return False
+    vertical_ok = (abs(upness) > 0.35) and (abs(upness) > abs(dir_vec[0]) * 0.8)
+    if not (upness > 0 and vertical_ok):
+        return False
+    knuckle_y = 0.5 * (pts[IX_MCP][1] + pts[PI_MCP][1])
+    margin = 0.06 * s
+    return pts[TH_TIP][1] < (knuckle_y - margin)
+
+def is_thumbs_down(landmark_list_xy):
+    pts = np.asarray(landmark_list_xy, dtype=np.float32)
+    s = _scale_from_points(pts)
+    if not _others_mostly_folded(pts, tol=0.45):
+        return False
+    th_ext, upness, dir_vec = _thumb_extended_and_dir(pts)
+    if not th_ext:
+        return False
+    vertical_ok = (abs(upness) > 0.35) and (abs(upness) > abs(dir_vec[0]) * 0.8)
+    if not (upness < 0 and vertical_ok):
+        return False
+    knuckle_y = 0.5 * (pts[IX_MCP][1] + pts[PI_MCP][1])
+    margin = 0.06 * s
+    return pts[TH_TIP][1] > (knuckle_y + margin)
+
+def _finger_extended(pts, mcp, pip, dip, tip, thres_deg=160):
+    return _pip_angle(pts, mcp, pip, dip) > thres_deg
+
+def is_open_palm(landmark_list_xy):
+    pts = np.asarray(landmark_list_xy, dtype=np.float32)
+    s = _scale_from_points(pts)
+    idx = _finger_extended(pts, IX_MCP, IX_PIP, IX_DIP, IX_TIP)
+    mid = _finger_extended(pts, MI_MCP, MI_PIP, MI_DIP, MI_TIP)
+    rin = _finger_extended(pts, RI_MCP, RI_PIP, RI_DIP, RI_TIP)
+    pin = _finger_extended(pts, PI_MCP, PI_PIP, PI_DIP, PI_TIP)
+    if idx and mid and rin and pin:
+        curls = [
+            _curl_score(pts, IX_MCP, IX_PIP, IX_DIP),
+            _curl_score(pts, MI_MCP, MI_PIP, MI_DIP),
+            _curl_score(pts, RI_MCP, RI_PIP, RI_DIP),
+            _curl_score(pts, PI_MCP, PI_PIP, PI_DIP),
+        ]
+        avg_curl = float(np.mean(curls))
+        span = np.linalg.norm(pts[IX_TIP] - pts[PI_TIP]) / s
+        return (avg_curl <= 0.20) and (span >= 0.28)
+    return False
+
+# ===================== Minimal UI/IO helpers =====================
+def draw_bounding_rect(img, brect):
+    cv.rectangle(img, (brect[0], brect[1]), (brect[2], brect[3]), (0, 0, 0), 1)
+    return img
+
+def calc_bounding_rect(image, landmarks):
+    image_width, image_height = image.shape[1], image.shape[0]
+    landmark_array = np.empty((0, 2), int)
+    for _, lm in enumerate(landmarks.landmark):
+        x = min(int(lm.x * image_width), image_width - 1)
+        y = min(int(lm.y * image_height), image_height - 1)
+        landmark_array = np.append(landmark_array, [np.array((x, y))], axis=0)
+    x, y, w, h = cv.boundingRect(landmark_array)
+    return [x, y, x + w, y + h]
+
+def calc_landmark_list(image, landmarks):
+    image_width, image_height = image.shape[1], image.shape[0]
+    pts = []
+    for _, lm in enumerate(landmarks.landmark):
+        x = min(int(lm.x * image_width), image_width - 1)
+        y = min(int(lm.y * image_height), image_height - 1)
+        pts.append([x, y])
+    return pts
+
+def pre_process_landmark(landmark_list):
+    temp = copy.deepcopy(landmark_list)
+    base_x, base_y = temp[0][0], temp[0][1]
+    for i, p in enumerate(temp):
+        temp[i][0] -= base_x
+        temp[i][1] -= base_y
+    flat = list(itertools.chain.from_iterable(temp))
+    maxv = max(list(map(abs, flat))) or 1.0
+    return [n / maxv for n in flat]
+
+def pre_process_point_history(image, point_history):
+    image_width, image_height = image.shape[1], image.shape[0]
+    temp = copy.deepcopy(point_history)
+    base_x, base_y = 0, 0
+    for i, p in enumerate(temp):
+        if i == 0:
+            base_x, base_y = p[0], p[1]
+        temp[i][0] = (temp[i][0] - base_x) / image_width
+        temp[i][1] = (temp[i][1] - base_y) / image_height
+    return list(itertools.chain.from_iterable(temp))
+
+def put_hud(img, text, y, color=(255,255,255)):
+    cv.putText(img, text, (10, y), cv.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 3, cv.LINE_AA)
+    cv.putText(img, text, (10, y), cv.FONT_HERSHEY_SIMPLEX, 0.8, color, 1, cv.LINE_AA)
+
+def is_palm_facing_camera_2d(hand_landmarks, handed_label: str, mirrored_view=True):
+    """
+    Heuristic: use 2D triangle orientation of (WRIST -> INDEX_MCP) x (WRIST -> PINKY_MCP).
+    With a mirrored webcam view (cv.flip(..., 1)), the sign flips per hand.
+    Returns True if the palm is likely facing the camera.
+    """
+    # pull normalized coords directly from MediaPipe landmarks
+    w = hand_landmarks.landmark[WRIST]
+    i = hand_landmarks.landmark[IX_MCP]
+    p = hand_landmarks.landmark[PI_MCP]
+
+    # handle mirrored: invert x if the image was flipped horizontally
+    def x_val(lm):
+        return (1.0 - lm.x) if mirrored_view else lm.x
+
+    vx1, vy1 = (x_val(i) - x_val(w), i.y - w.y)  # WRIST->INDEX_MCP
+    vx2, vy2 = (x_val(p) - x_val(w), p.y - w.y)  # WRIST->PINKY_MCP
+
+    cross = vx1 * vy2 - vy1 * vx2  # z-component of 2D cross product
+
+    # Empirical rule for mirrored webcam:
+    #  - Right hand: palm toward camera → cross < 0
+    #  - Left  hand: palm toward camera → cross > 0
+    if handed_label.lower().startswith("right"):
+        return cross < 0
+    else:
+        return cross > 0
+
+# ===================== Main =====================
+def main():
+    from model import KeyPointClassifier, PointHistoryClassifier
+    from utils import CvFpsCalc
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--width", type=int, default=960)
+    parser.add_argument("--height", type=int, default=540)
+    parser.add_argument("--max_hands", type=int, default=2)
+    parser.add_argument("--min_detection_confidence", type=float, default=0.7)
+    parser.add_argument("--min_tracking_confidence", type=float, default=0.5)
+    parser.add_argument("--use_static_image_mode", action="store_true")
+    args = parser.parse_args()
+
+    cap = cv.VideoCapture(args.device)
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(
+        static_image_mode=args.use_static_image_mode,
+        max_num_hands=max(1, args.max_hands),
+        min_detection_confidence=args.min_detection_confidence,
+        min_tracking_confidence=args.min_tracking_confidence,
+    )
+    kpc = KeyPointClassifier()
+    phc = PointHistoryClassifier()
+
+    with open('model/keypoint_classifier/keypoint_classifier_label.csv', encoding='utf-8-sig') as f:
+        key_labels = [row[0] for row in csv.reader(f)]
+    with open('model/point_history_classifier/point_history_classifier_label.csv', encoding='utf-8-sig') as f:
+        hist_labels = [row[0] for row in csv.reader(f)]
+
+    fps_calc = CvFpsCalc(buffer_len=10)
+
+    history_len = 16
+    point_histories = {"Left": deque(maxlen=history_len), "Right": deque(maxlen=history_len)}
+    finger_histories = {"Left": deque(maxlen=history_len), "Right": deque(maxlen=history_len)}
+
+    # Start music: C-major chord
+    player = MusicPlayer(host=HOST, port=MUSIC_PORT, path=OSC_ARM_PATH, bpm=BPM_DEFAULT, velocity=80)
+    player.set_mode("chord_cmaj")
+
+    last_dyn_send = 0.0
+    dyn_state = None
+
+    # delayed stop timer for open hand (2s hold)
+    stop_request_started_at = None
+
+    try:
+        while True:
+            fps = fps_calc.get()
+
+            key = cv.waitKey(1) & 0xFF
+            if key in (27, ord('q'), ord('Q')):
+                break
+
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = cv.flip(frame, 1)
+            debug = frame.copy()
+
+            rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            results = hands.process(rgb)
+            rgb.flags.writeable = True
+
+            want_stop = False
+            switch_to = None     # "chord_cmaj" | "chord_cmin" | "chord_gmaj" | "chord_caug" | "chord_cdim"
+            highest_hand_norm = None
+            seen = set()
+
+            if results.multi_hand_landmarks is not None:
+                for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                    label = handedness.classification[0].label
+                    seen.add(label)
+                    if label not in point_histories:
+                        point_histories[label] = deque(maxlen=history_len)
+                        finger_histories[label] = deque(maxlen=history_len)
+
+                    brect = calc_bounding_rect(debug, hand_lms)
+                    pts = calc_landmark_list(debug, hand_lms)
+                    draw_bounding_rect(debug, brect)
+
+                    pre = pre_process_landmark(pts)
+                    sid = kpc(pre)
+                    sign_txt = key_labels[sid]
+
+                    # point history (for spin)
+                    if sid == 2:
+                        point_histories[label].append(pts[8])
+                    else:
+                        point_histories[label].append([0, 0])
+
+                    pre_hist = pre_process_point_history(debug, point_histories[label])
+                    fid = 0
+                    if len(pre_hist) == (history_len * 2):
+                        fid = phc(pre_hist)
+                    finger_histories[label].append(fid)
+                    most = Counter(finger_histories[label]).most_common()
+                    hist_txt = hist_labels[most[0][0]]
+
+                    # Gesture mapping → CHORDS
+                    if is_open_palm(pts):
+                        sign_txt = "Open Hand"
+                        want_stop = True
+                    elif is_thumbs_up(pts):
+                        sign_txt = "Thumbs Up"
+                        switch_to = "chord_cdim"   # approve → C diminished chord
+                    elif is_thumbs_down(pts):
+                        sign_txt = "Thumbs Down"
+                        switch_to = "chord_cmin"   # disapprove → C minor chord
+
+                    # Finger spin with direction:
+                    ht = hist_txt.strip().lower()
+                    if is_spin_cw(ht):
+                        switch_to = "chord_cmaj"   # clockwise → C major CHORD
+                    elif is_spin_ccw(ht):
+                        switch_to = "chord_cmaj"   # counter-clockwise → C major CHORD (was arpeggio before)
+
+                    # Dynamics by highest hand
+                    wrist_norm = pts[WRIST][1] / float(frame.shape[0])
+                    if highest_hand_norm is None or wrist_norm < highest_hand_norm:
+                        highest_hand_norm = wrist_norm
+
+                    cv.putText(debug, f"{label}:{sign_txt} | {hist_txt}",
+                               (brect[0] + 5, max(15, brect[1] - 6)),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv.LINE_AA)
+
+            for lab in ("Left", "Right"):
+                if lab not in seen:
+                    point_histories[lab].append([0, 0])
+
+            # ================== Apply playback logic (with 2s hold for Open Hand) ==================
+            now = time.time()
+            if want_stop:
+                if stop_request_started_at is None:
+                    stop_request_started_at = now
+                elapsed = now - stop_request_started_at
+                remaining = max(0.0, 2.0 - elapsed)
+                if elapsed >= 2.0:
+                    player.pause()
+                    put_hud(debug, "PLAYBACK: STOP", 120, (0,0,255))
+                    stop_request_started_at = None  # reset so the next open hand needs a fresh 2s
+                else:
+                    put_hud(debug, f"Open hand detected — stopping in {remaining:.1f}s", 120, (0,200,255))
+            else:
+                # pose lost -> cancel pending stop
+                if stop_request_started_at is not None:
+                    put_hud(debug, "Stop canceled", 120, (255,255,0))
+                stop_request_started_at = None
+
+            # Mode switches (thumbs/spins) resume immediately if not in stop-hold window
+            if not want_stop and switch_to is not None:
+                player.set_mode(switch_to)
+                put_hud(debug, f"MODE: {switch_to}", 150, (0,255,0))
+            # =======================================================================================
+
+            # Dynamics mapping (higher hand => louder)
+            if highest_hand_norm is not None:
+                gain = 1.0 - float(highest_hand_norm)  # 0 bottom .. 1 top
+                target_vel = int(round(VEL_MIN + gain * (VEL_MAX - VEL_MIN)))
+                if dyn_state is None:
+                    dyn_state = target_vel
+                else:
+                    dyn_state = int(round(dyn_state * (1 - DYNAMICS_SMOOTH) + target_vel * DYNAMICS_SMOOTH))
+                player.set_velocity(dyn_state)
+                if (now - last_dyn_send) >= DYNAMICS_SEND_EVERY:
+                    put_hud(debug, f"Dynamics (vel): {dyn_state}", 170, (255,255,0))
+                    last_dyn_send = now
+
+            # HUD
+            put_hud(debug, f"FPS: {fps}", 30)
+            with player._lock:
+                cur_mode = player._mode
+            put_hud(debug, f"Mode: {cur_mode}", 60)
+
+            cv.imshow("Hand Gestures → Chord Control", debug)
+
+    finally:
+        player.shutdown()
+        cap.release()
+        cv.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

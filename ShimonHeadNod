@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+from pythonosc import udp_client
+import time
+import argparse
+
+def build_c_major_arpeggio(base_note=60, octaves=1, mode="updown"):
+    """
+    base_note: MIDI note for C (60 = middle C)
+    octaves:   how many octaves to span upward
+    mode:      "up", "down", or "updown"
+    """
+    triad_offsets = [0, 4, 7]  # C, E, G
+    notes_up = []
+    for o in range(octaves):
+        root = base_note + 12 * o
+        notes_up += [root + off for off in triad_offsets]
+    # add top C to cap the ascent
+    notes_up.append(base_note + 12 * octaves)
+
+    if mode == "up":
+        return notes_up
+    elif mode == "down":
+        return list(reversed(notes_up))
+    elif mode == "updown":
+        return notes_up + list(reversed(notes_up[:-1]))
+    else:
+        raise ValueError("mode must be 'up', 'down', or 'updown'")
+
+def main():
+    p = argparse.ArgumentParser(description="Continuously play a C-major arpeggio via OSC (/arm [note, velocity]).")
+    p.add_argument("--host", default="192.168.1.1", help="Shimon IP address")
+    p.add_argument("--port", type=int, default=9010, help="OSC port (default 9010)")
+    p.add_argument("--path", default="/arm", help="OSC address path (default /arm)")
+    p.add_argument("--base", type=int, default=60, help="Base MIDI note for C (60 = middle C)")
+    p.add_argument("--octaves", type=int, default=1, help="Number of octaves to span")
+    p.add_argument("--mode", choices=["up", "down", "updown"], default="updown", help="Arpeggio direction")
+    p.add_argument("--bpm", type=float, default=120.0, help="Tempo (beats per minute)")
+    p.add_argument("--velocity", type=int, default=80, help="Strike velocity (0–127)")
+    p.add_argument("--gap", type=float, default=0.0,
+                   help="Extra seconds between cycles (e.g., 0.25 adds a small breath each loop)")
+    args = p.parse_args()
+
+    client = udp_client.SimpleUDPClient(args.host, args.port)
+    notes = build_c_major_arpeggio(base_note=args.base, octaves=args.octaves, mode=args.mode)
+    beat_sec = 60.0 / float(args.bpm)
+
+    print(f"Playing continuously: {notes}  at {args.bpm} BPM  (Ctrl+C to stop)")
+    try:
+        while True:
+            for n in notes:
+                client.send_message(args.path, [int(n), int(args.velocity)])
+                time.sleep(beat_sec)
+            if args.gap > 0:
+                time.sleep(args.gap)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+if __name__ == "__main__":
+    main()
