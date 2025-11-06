@@ -5,21 +5,39 @@ import math
 import numpy as np
 import mediapipe as mp
 from pythonosc import udp_client
+from collections import deque
 
-# === Setup OSC clients ===
-note_client = udp_client.SimpleUDPClient("192.168.1.1", 9010)
-head_client = udp_client.SimpleUDPClient("192.168.1.1", 9000)
+tempo_detection_enabled = threading.Event()
+
+SHOW_WINDOW = False
+
+# # === Setup OSC clients ===
+# note_client = udp_client.SimpleUDPClient("192.168.1.1", 9010)
+# head_client = udp_client.SimpleUDPClient("192.168.1.1", 9000)
+
+# Parameters
+WINDOW_SIZE = 30                 # number of recent frames to analyze
+NOD_THRESHOLD = 2.5            # vertical movement amplitude threshold
+SHAKE_THRESHOLD = 2.5           # horizontal movement amplitude threshold
+MOVEMENT_RATIO_THRESHOLD = 0.6   # ratio of frames that must show motion
+
+# Buffers for smoothing
+x_positions = deque(maxlen=WINDOW_SIZE)
+y_positions = deque(maxlen=WINDOW_SIZE)
+
+# pitch_vals = deque(maxlen=WINDOW_SIZE)
+# yaw_vals = deque(maxlen=WINDOW_SIZE)
 
 # === MediaPipe setup ===
 mp_face_mesh = mp.solutions.face_mesh
-mp_hands = mp.solutions.hands
+# mp_hands = mp.solutions.hands
 face_mesh = mp_face_mesh.FaceMesh(
     max_num_faces=1,
     refine_landmarks=True,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
-hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.5)
+# hands = mp_hands.Hands(max_num_hands=2, min_detection_confidence=0.7, min_tracking_confidence=0.5)
 mp_drawing = mp.solutions.drawing_utils
 drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
 
@@ -43,7 +61,6 @@ phrase = [
     (-0.5, 71), (-0.5, 72)
 ]
 
-
 # === Gesture detection helpers ===
 WRIST = 0
 TH_MCP, TH_IP, TH_TIP = 2, 3, 4
@@ -51,6 +68,31 @@ IX_MCP, IX_PIP, IX_DIP, IX_TIP = 5, 6, 7, 8
 MI_MCP, MI_PIP, MI_DIP, MI_TIP = 9, 10, 11, 12
 RI_MCP, RI_PIP, RI_DIP, RI_TIP = 13, 14, 15, 16
 PI_MCP, PI_PIP, PI_DIP, PI_TIP = 17, 18, 19, 20
+
+def get_head_angles(face_landmarks):
+    # Use normalized landmark coordinates (0–1 range)
+    lm = face_landmarks.landmark
+
+    # Key points
+    nose = np.array([lm[1].x, lm[1].y, lm[1].z])
+    left_eye = np.array([lm[33].x, lm[33].y, lm[33].z])
+    right_eye = np.array([lm[263].x, lm[263].y, lm[263].z])
+    chin = np.array([lm[152].x, lm[152].y, lm[152].z])
+    forehead = np.array([lm[10].x, lm[10].y, lm[10].z])
+
+    # Horizontal axis (eye to eye)
+    eye_vec = right_eye - left_eye
+    eye_vec /= np.linalg.norm(eye_vec)
+
+    # Vertical axis (nose to chin)
+    vert_vec = chin - forehead
+    vert_vec /= np.linalg.norm(vert_vec)
+
+    # Compute angles (in degrees)
+    yaw = math.degrees(math.atan2(eye_vec[2], eye_vec[0]))   # left-right
+    pitch = math.degrees(math.atan2(vert_vec[2], vert_vec[1]))  # up-down
+
+    return pitch, yaw
 
 def _pip_angle(pts, mcp, pip, dip):
     v1 = pts[mcp] - pts[pip]
@@ -101,65 +143,86 @@ def is_thumbs_down(pts):
     th_ext, upness = _thumb_extended_and_dir(pts)
     return th_ext and upness < -0.35
 
-# === Volume gesture detection (hand height → velocity) ===
-VEL_MIN, VEL_MAX = 30, 120
-DYNAMICS_SMOOTH = 0.2
-dyn_state = velocity  # initial smoothed velocity
+def detect_motion_state():
+    """Return 'Idle', 'Nodding', or 'Shaking' based on recent nose motion."""
+    if len(x_positions) < WINDOW_SIZE:
+        return "Idle"
 
-def detect_volume_gesture(pts):
-    global dyn_state, velocity
+    x = np.array(x_positions)
+    y = np.array(y_positions)
+    
+    def smooth(signal, window=5):
+        if len(signal) < window:
+            return signal
+        kernel = np.ones(window) / window
+        return np.convolve(signal, kernel, mode='same')
 
-    # wrist y is normalized [0,1], smaller = higher
-    wrist_y_norm = pts[WRIST][1]
+    x = smooth(x)
+    y = smooth(y)
 
-    # invert so top = 1, bottom = 0
-    gain = 1.0 - wrist_y_norm
-    target_vel = int(round(VEL_MIN + gain * (VEL_MAX - VEL_MIN)))
+    # Center signals around zero
+    x -= np.mean(x)
+    y -= np.mean(y)
 
-    # smooth velocity
-    dyn_state = int(round(dyn_state * (1 - DYNAMICS_SMOOTH) + target_vel * DYNAMICS_SMOOTH))
-    velocity = dyn_state
+    # Compute per-frame deltas (movement magnitude)
+    dx = np.abs(np.diff(x))
+    dy = np.abs(np.diff(y))
 
+    # Compute percentage of frames with noticeable motion
+    moving_x_ratio = np.mean(dx > 1.0)
+    moving_y_ratio = np.mean(dy > 1.0)
 
-# === Robot phrase ===
-# def play_phrase():
-#     global phrase_playing, last_gesture, gesture_timestamp
+    # Compute movement amplitude (std deviation)
+    x_std = np.std(x)
+    y_std = np.std(y)
 
-#     with lock:
-#         phrase_playing = True
-#         last_gesture = None
-#         gesture_timestamp = time.time()
+    # Count zero crossings (oscillations)
+    def zero_crossings(signal):
+        return np.count_nonzero(np.diff(np.sign(signal)))
 
-#     print("🎵 Shimon: Starting phrase")
+    x_zc = zero_crossings(x)
+    y_zc = zero_crossings(y)
 
-#     for head_angle, note in phrase:
-#         with lock:
-#             v = velocity
-#         send_head_message_to_shimon(head_angle)
-#         send_note_to_shimon(note, v)
-#         time.sleep(1)
+    # Detect based on amplitude, consistency, and oscillation
+    is_nodding = (
+        y_std > NOD_THRESHOLD
+        and y_zc > 4
+        and moving_y_ratio > MOVEMENT_RATIO_THRESHOLD
+    )
+    is_shaking = (
+        x_std > SHAKE_THRESHOLD
+        and x_zc > 4
+        and moving_x_ratio > MOVEMENT_RATIO_THRESHOLD
+    )
 
-#     print("🎵 Shimon: Finished phrase")
-#     with lock:
-#         phrase_playing = False
+    if is_nodding and not is_shaking:
+        return "Nodding"
+    elif is_shaking and not is_nodding:
+        return "Shaking"
+    else:
+        return "Idle"
+    
+def angle_between(v1, v2):
+    v1 = v1 / np.linalg.norm(v1)
+    v2 = v2 / np.linalg.norm(v2)
+    cross = np.cross(v1, v2)
+    dot = np.dot(v1, v2)
+    sign = np.sign(np.dot(cross, np.array([1, 0, 0])))
+    return math.degrees(math.atan2(np.linalg.norm(cross), dot)) * sign
 
-#     # Decide what to do next
-#     if last_gesture == "thumbs_down":
-#         print("👎 Replaying phrase")
-#         start_phrase()
-#     elif last_gesture == "thumbs_up":
-#         send_head_message_to_shimon(0.0)
-#         print("👍 Waiting for eye contact again")
-#     else:
-#         send_head_message_to_shimon(0.0)
-#         print("No gesture detected, waiting for eye contact again")
-
-# def start_phrase():
-#     global note_thread
-#     with lock:
-#         if not phrase_playing:
-#             note_thread = threading.Thread(target=play_phrase, daemon=True)
-#             note_thread.start()
+def estimate_tempo_from_nod(nod_times, window=5):
+    if (len(nod_times) < 5):
+        return None
+    
+    recent = nod_times[-window:]
+    
+    intervals = [t2 - t1 for t1, t2 in zip(recent[:-1], recent[1:])]
+    
+    avg_interval = np.median(intervals)
+    
+    tempo = 60 / avg_interval
+    
+    return np.floor(tempo)
 
 # === Face detection ===
 def face_is_looking_at_camera(face_landmarks):
@@ -177,7 +240,7 @@ def face_is_looking_at_camera(face_landmarks):
     return yaw_ok and pitch_ok
 
 # === Main loop ===
-def start_gestures_monitor(on_eye_contact_callback, on_hand_callback):
+def start_gestures_monitor(on_eye_contact_callback, on_approval_callback, on_tempo_callback):
     """
     Starts camera loop in a background thread.
     Calls `on_eye_contact_callback()` whenever eye contact is detected.
@@ -187,18 +250,57 @@ def start_gestures_monitor(on_eye_contact_callback, on_hand_callback):
         prev_thumbs_up = False
         prev_thumbs_down = False
         
+        last_nod_time = 0
+        last_shake_time = 0
+        NOD_COOLDOWN = 1.0   
+        SHAKE_COOLDOWN = 1.0
+        
+        prev_time = time.time()
+        frame_count = 0
+        
+        nose_y_list = []
+        avg_nose_y = 0
+
+        nodding = False
+        nod_count = 0
+        nod_times = []
+        
         while cap.isOpened():
             success, image = cap.read()
             if not success:
                 continue
+            
+            frame_count += 1
+            now = time.time()
+            elapsed = now - prev_time
+            if elapsed >= 1.0:
+                fps = frame_count / elapsed
+                print(f"Current loop FPS: {fps:.2f}")
+                frame_count = 0
+                prev_time = now
 
-            # PREPROCESS FRAME
-            image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            face_results = face_mesh.process(image)
-            hand_results = hands.process(image)
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            # Flip and convert only once (flip horizontally so head motion matches screen)
+            image = cv2.flip(image, 1)
+
+            # Convert to RGB only if needed by MediaPipe (it requires RGB)
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            # Run detection
+            rgb_image.flags.writeable = False
+            face_results = face_mesh.process(rgb_image)
+            # hand_results = hands.process(rgb_image)
+            rgb_image.flags.writeable = True
+
+            # Only draw if window is enabled
+            if SHOW_WINDOW and face_results.multi_face_landmarks:
+                for face_landmarks in face_results.multi_face_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image,
+                        face_landmarks,
+                        mp_face_mesh.FACEMESH_CONTOURS,
+                        drawing_spec,
+                        drawing_spec
+                    )
 
             # FACE DETECTION
             face_is_looking = False
@@ -207,40 +309,136 @@ def start_gestures_monitor(on_eye_contact_callback, on_hand_callback):
                     face_is_looking = face_is_looking_at_camera(face_landmarks)
 
             # Detect eye contact state change
-            if face_is_looking and not prev_face_is_looking:
+            if not tempo_detection_enabled.is_set() and face_is_looking and not prev_face_is_looking:
                 print("👀 Eye contact detected")
                 on_eye_contact_callback()
 
             prev_face_is_looking = face_is_looking
 
-            # cv2.imshow('Eye Contact Detector', image)
-            thumbs_up = False
-            thumbs_down = False
-            if hand_results.multi_hand_landmarks:
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    pts = np.array([[lm.x, lm.y] for lm in hand_landmarks.landmark])
-                    detect_volume_gesture(pts)
+            # APPROVAL DETECTION - NOD/SHAKE
+            if face_results.multi_face_landmarks:
+                face_landmarks = face_results.multi_face_landmarks[0]
+                h, w, _ = image.shape
 
-                    if is_thumbs_up(pts):
-                        thumbs_up = True
-                    elif is_thumbs_down(pts):
-                        thumbs_down = True
+                # Nose tip landmark index = 1
+                nose_tip = face_landmarks.landmark[1]
+                x = nose_tip.x * w
+                y = nose_tip.y * h
 
-                    # Call the gesture callback only when gesture changes
-                    if thumbs_up and not prev_thumbs_up:
-                        print("🖐 Gesture detected: thumbs_up")
-                        on_hand_callback(1)
+                x_positions.append(x)
+                y_positions.append(y)
+                
+                state = detect_motion_state()
+                
+                cv2.putText(
+                    image,
+                    f"State: {state}",
+                    (30, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0) if state == "Nodding" else (0, 0, 255) if state == "Shaking" else (255, 255, 255),
+                    2,
+                )
                     
-                    prev_thumbs_up = thumbs_up
+                now = time.time()
+
+                if not tempo_detection_enabled.is_set():
+                    if state == "Nodding" and (now - last_nod_time > NOD_COOLDOWN):
+                        print("-- Gesture detected: Nod")
+                        on_approval_callback(1)
+                        last_nod_time = now
+
+                    if state == "Shaking" and (now - last_shake_time > SHAKE_COOLDOWN):
+                        print("-- Gesture detected: Shake")
+                        on_approval_callback(0)
+                        last_shake_time = now
+            
+            # TEMPO DETECTION
+            if tempo_detection_enabled.is_set() and face_results.multi_face_landmarks:
+                landmarks = face_results.multi_face_landmarks[0]
+                h, w = image.shape[:2]
+                
+                # Get nose tip (landmark #1)
+                # nose_tip = landmarks.landmark[1]
+                # nose_x = int(nose_tip.x * w)
+                # nose_y = int(nose_tip.y * h)
+                
+                chin = landmarks.landmark[152]
+                forehead = landmarks.landmark[10]
+                
+                chin_x, chin_y = int(chin.x * w), int(chin.y * h)
+                forehead_x, forehead_y = int(forehead.x * w), int(forehead.y * h)
+
+                chin_point = np.array([chin.x * w, chin.y * h, chin.z * w])
+                forehead_point = np.array([forehead.x * w, forehead.y * h, forehead.z * w])
+
+                v = forehead_point - chin_point
+                
+                vertical = np.array([0, -1, 0])
+                pitch_angle = angle_between(v, vertical)
+                
+                # cv2.putText(image, f"Pitch: {pitch_angle:.2f}", (30, 30),
+                #                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                if pitch_angle < -6: 
+                    # cv2.putText(frame, "NOD", (30, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
                     
-                    if thumbs_down and not prev_thumbs_down:
-                        print("🖐 Gesture detected: thumbs_down")
-                        on_hand_callback(0)
+                    if (not nodding):
+                        nodding = True
+                        print("NOD")
+                        nod_times.append(time.time())
+                        tempo = estimate_tempo_from_nod(nod_times)
+                        if tempo:
+                            print("Tempo: ", tempo)
+                            on_tempo_callback(tempo)
+                            # send_to_max("/tempo", tempo, max_port=7401)
+                else: 
+                    if (nodding):
+                        nodding = False
+                        nod_count += 1
+                        print("Nod Done -- total: ", nod_count)
+                # try:
+                #     if tempo:
+                #         cv2.putText(image, f"Tempo: {tempo:.2f}", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                # except:
+                #     print("NO TEMPO")
+
+            # # THUMB DETECTION
+            # thumbs_up = False
+            # thumbs_down = False
+            # if hand_results.multi_hand_landmarks:
+            #     for hand_landmarks in hand_results.multi_hand_landmarks:
+            #         pts = np.array([[lm.x, lm.y] for lm in hand_landmarks.landmark])
+            #         detect_volume_gesture(pts)
+
+            #         if is_thumbs_up(pts):
+            #             thumbs_up = True
+            #         elif is_thumbs_down(pts):
+            #             thumbs_down = True
+
+            #         # Call the gesture callback only when gesture changes
+            #         if thumbs_up and not prev_thumbs_up:
+            #             print("🖐 Gesture detected: thumbs_up")
+            #             on_hand_callback(1)
                     
-                    prev_thumbs_down = thumbs_down
+            #         prev_thumbs_up = thumbs_up
                     
-                    if cv2.waitKey(5) & 0xFF == ord('q'):
-                        break
+            #         if thumbs_down and not prev_thumbs_down:
+            #             print("🖐 Gesture detected: thumbs_down")
+            #             on_hand_callback(0)
+                    
+            #         prev_thumbs_down = thumbs_down
+                    
+            # cv2.imshow("Gesture Monitor", image)
+            # cv2.waitKey(1)
+            if SHOW_WINDOW:
+                cv2.imshow("Gesture Monitor", image)
+                if cv2.waitKey(5) & 0xFF == ord('q'):
+                    break
+            else:
+                # still call waitKey to let OpenCV tick internally (no-op)
+                cv2.waitKey(1)
+
 
         cap.release()
         cv2.destroyAllWindows()
@@ -248,75 +446,6 @@ def start_gestures_monitor(on_eye_contact_callback, on_hand_callback):
     # Run in a background thread
     t = threading.Thread(target=camera_loop, daemon=True)
     t.start()
+    # SHOW_WINDOW = True
+    # camera_loop()
     
-# prev_face_is_looking = False
-
-# while cap.isOpened():
-#     success, image = cap.read()
-#     if not success:
-#         print("Ignoring empty camera frame.")
-#         continue
-
-#     image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
-#     image.flags.writeable = False
-#     face_results = face_mesh.process(image)
-#     hand_results = hands.process(image)
-#     image.flags.writeable = True
-#     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-#     face_is_looking = False
-#     if face_results.multi_face_landmarks:
-#         for face_landmarks in face_results.multi_face_landmarks:
-#             face_is_looking = face_is_looking_at_camera(face_landmarks)
-#             mp_drawing.draw_landmarks(
-#                 image=image,
-#                 landmark_list=face_landmarks,
-#                 connections=mp_face_mesh.FACEMESH_TESSELATION,
-#                 landmark_drawing_spec=None,
-#                 connection_drawing_spec=drawing_spec
-#             )
-
-#     # --- Gesture detection ---
-#     if hand_results.multi_hand_landmarks:
-#         for hand_landmarks in hand_results.multi_hand_landmarks:
-#             mp_drawing.draw_landmarks(
-#                 image,
-#                 hand_landmarks,
-#                 mp_hands.HAND_CONNECTIONS,
-#                 mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=2),
-#                 mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
-#             )
-
-#             pts = np.array([[lm.x, lm.y] for lm in hand_landmarks.landmark])
-#             detect_volume_gesture(pts)
-#             if is_thumbs_up(pts):
-#                 with lock:
-#                     last_gesture = "thumbs_up"
-#             elif is_thumbs_down(pts):
-#                 with lock:
-#                     last_gesture = "thumbs_down"
-
-#     # --- State transitions ---
-#     if face_is_looking and not prev_face_is_looking:
-#         print("👀 Eye contact detected")
-#         # start_phrase()
-
-#     prev_face_is_looking = face_is_looking
-
-#     # --- UI Overlay ---
-#     text = "Looking at camera" if face_is_looking else "Waiting..."
-#     color = (0, 255, 0) if face_is_looking else (0, 0, 255)
-#     cv2.putText(image, text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
-#     if last_gesture:
-#         cv2.putText(image, f"Gesture: {last_gesture}", (50, 100),
-#                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
-#     cv2.putText(image, f"Velocity: {velocity}", (50, 150),
-#                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-#     cv2.imshow('Shimon Interaction', image)
-
-#     if cv2.waitKey(5) & 0xFF == ord('q'):
-#         break
-
-# cap.release()
-# cv2.destroyAllWindows()
