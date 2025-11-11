@@ -21,6 +21,10 @@ tempo_lock = threading.Lock()
 
 NOTE_LATENCY = 0.5
 
+def send_to_max(message, value, host="127.0.0.1", port=7402):
+    client = udp_client.SimpleUDPClient(host, port)
+    client.send_message(message, value)
+
 def send_note_to_shimon(note, velocity, host="192.168.1.1", port=9010):
     client = udp_client.SimpleUDPClient(host, port)
     client.send_message("/arm", [note, velocity])
@@ -217,32 +221,35 @@ def keyboard_phrase(port_index):
                 
             if (recording_done.is_set()):
                 print("ALL DONE")
-                play_sequence(events, 0)
+                # play_sequence(events, 0)
                 
-                while True:  # approval loop
-                    global approval_result
-                    print("WAITING FOR APPROVAL...")
-                    with approval_lock:
-                        approval_result = None  # reset before waiting
-                    accepting_approval.set()
+                # while True:  # approval loop
+                #     global approval_result
+                #     print("WAITING FOR APPROVAL...")
+                #     with approval_lock:
+                #         approval_result = None  # reset before waiting
+                #     accepting_approval.set()
 
-                    # Wait for approval signal
-                    while True:
-                        with approval_lock:
-                            if approval_result is not None:
-                                result = approval_result
-                                approval_result = None
-                                break
-                        time.sleep(0.05)
+                #     # Wait for approval signal
+                #     while True:
+                #         with approval_lock:
+                #             if approval_result is not None:
+                #                 result = approval_result
+                #                 approval_result = None
+                #                 break
+                #         time.sleep(0.05)
 
-                    if result == 0:
-                        print("!!DISLIKED - PLAYING AGAIN")
-                        play_sequence(events, temperature=1.0)
-                    elif result == 1:
-                        print("!!LIKED IT")
-                        shimon_nod()
-                        break  # exit approval loop (nod detected)
-                    
+                #     if result == 0:
+                #         print("!!DISLIKED - PLAYING AGAIN")
+                #         play_sequence(events, temperature=1.0)
+                #     elif result == 1:
+                #         print("!!LIKED IT")
+                #         shimon_nod()
+                #         break  # exit approval loop (nod detected)
+                
+                play_midi_track('CDL_1.mid')    
+                
+                
                 events.clear()
                 i = 0
                 recording_done.clear()
@@ -303,57 +310,33 @@ def render_midi_at_tempo(input_filename, output_filename, track_index=1):
     print(f"✅ Saved: {output_filename}")
     
 def play_midi_track(input_filename, track_index=1):
-    global tempo
+    """Plays a MIDI file at its original tempo and sends notes to Shimon."""
+    recording_done.clear()
+    look_forward()
 
     mid = mido.MidiFile(input_filename)
-    ppq = mid.ticks_per_beat
-    seconds_per_beat = 60.0 / tempo
-    seconds_per_tick = seconds_per_beat / ppq
+    print(f"🎼 Playing track {track_index} from '{input_filename}' (original tempo)")
 
-    print(f"🎼 Playing track {track_index} from '{input_filename}' at {tempo:.1f} BPM (PPQ={ppq})")
-
-    t0 = time.monotonic()
-    found_first_note = False
-
-    # --- [1] Find tick offset of first note to skip silence ---
-    silence_ticks = 0
-    cumulative_ticks = 0
-    for msg in mid.tracks[track_index]:
-        cumulative_ticks += msg.time
+    # --- [1] Use mido's built-in playback iterator ---
+    # It automatically converts tick times to seconds,
+    # respecting tempo changes and time signatures.
+    for msg in mid.play(meta_messages=True):  # meta_messages=True ensures tempo updates are respected
         if msg.type == "note_on" and msg.velocity > 0:
-            silence_ticks = cumulative_ticks
-            break
-    print(f"🕐 Trimming {silence_ticks} ticks of silence from start")
-    cumulative_ticks = 0
-    # -----------------------------------------------------------
-
-    for msg in mid.tracks[track_index]:
-        cumulative_ticks += msg.time
-        if cumulative_ticks < silence_ticks:
-            continue  # skip leading silence
-
-        time.sleep(msg.time * seconds_per_tick)
-
-        if msg.type == "note_on" and msg.velocity > 0:
-            # --- [2] Reset timer when first note hits ---
-            if not found_first_note:
-                t0 = time.monotonic()
-                found_first_note = True
-            # --------------------------------------------
-
             note = msg.note
             velocity = msg.velocity
 
-            # constrain playable range
+            # constrain playable range for Shimon
             if note < 48:
                 note += 12
             elif note > 95:
                 note -= 12
 
             send_note_to_shimon(note, velocity)
-            # print(f"[{time.monotonic() - t0:6.3f}s] 🎹 Note {note} vel {velocity}")
+            print(f"🎹 Note {note} vel {velocity}")
 
     print("✅ Playback complete.")
+    accepting_approval.set()
+    look_left()
 
     
 def play_notes():
@@ -455,16 +438,19 @@ if __name__ == "__main__":
     midi_in = rtmidi.MidiIn()
     ports = midi_in.get_ports()
     print("Available ports:", ports)
+    
+    send_to_max("/tempo", 120)
+    send_to_max("/status", 1)
 
     # Ask user to choose a port
     port_index = int(input("Select input port number: "))
 
     start_gestures_monitor(on_eye_contact, on_approval_detected, on_tempo_detected)
     
-    # for i in range(2):
-    #     look_left()
+    for i in range(2):
+        look_left()
     
-    #     keyboard_phrase(port_index)
+        keyboard_phrase(port_index)
         
     look_left()
     tempo_detection_enabled.set()
@@ -478,8 +464,6 @@ if __name__ == "__main__":
     look_forward()
     
     shimon_synced()
-    
-    # render_midi_at_tempo("furelise.mid", "shimonelise.mid")
     
     look_forward()
         
