@@ -19,6 +19,9 @@ accepting_tempo = threading.Event()
 tempo = None
 tempo_lock = threading.Lock()
 
+part_1_flag = -1
+phrase_num = 0
+
 NOTE_LATENCY = 0.5
 
 def send_to_max(message, value, host="127.0.0.1", port=7402):
@@ -187,6 +190,7 @@ def on_tempo_detected(detected_tempo):
         print('Cant detect tempo yet!')
         
 def keyboard_phrase(port_index):
+    global phrase_num
     print("KEYBOARD SEND")
     
     events = []
@@ -199,68 +203,84 @@ def keyboard_phrase(port_index):
     i = 0
     while True:
         try: 
-            msg = midi_in.get_message()
-            if msg:
-                now = time.time()
-                delta = now - last_time
-                last_time = now
-                
-                event = {
-                    "index": i,
-                    "note": msg[0][1],
-                    "velocity": msg[0][2],
-                    "delta": delta
-                }
-                events.append(event)
-                print(event)
-                i += 1
-                
-                if (len(events) >= 5):
-                    print("NOW WE CAN SEE")
+            if (part_1_flag == 1):
+                msg = midi_in.get_message()
+                if msg:
+                    now = time.time()
+                    delta = now - last_time
+                    last_time = now
+                    
+                    event = {
+                        "index": i,
+                        "note": msg[0][1],
+                        "velocity": msg[0][2],
+                        "delta": delta
+                    }
+                    events.append(event)
+                    print(event)
+                    i += 1
+                    
+                    if (len(events) >= 5):
+                        print("NOW WE CAN SEE")
+                        accepting_eye_contact.set()
+                    
+                if (recording_done.is_set()):
+                    print("ALL DONE")
+
+                    play_sequence(events, 0)
+                    
+                    while True:  # approval loop
+                        global approval_result
+                        print("WAITING FOR APPROVAL...")
+                        with approval_lock:
+                            approval_result = None  # reset before waiting
+                        accepting_approval.set()
+
+                        # Wait for approval signal
+                        while True:
+                            with approval_lock:
+                                if approval_result is not None:
+                                    result = approval_result
+                                    approval_result = None
+                                    break
+                            time.sleep(0.05)
+
+                        if result == 0:
+                            print("!!DISLIKED - PLAYING AGAIN")
+                            play_sequence(events, temperature=1.0)
+                        elif result == 1:
+                            print("!!LIKED IT")
+                            shimon_nod()
+                            break  # exit approval loop (nod detected)
+                    
+                    events.clear()
+                    i = 0
+                    recording_done.clear()
+                    accepting_eye_contact.clear()
+                    accepting_approval.clear()
+                    print("READY FOR NEXT PHRASE")
+                    break     
+                           
+            elif (part_1_flag == 0):
+                while True:
                     accepting_eye_contact.set()
-                
-            if (recording_done.is_set()):
-                print("ALL DONE")
-                # play_sequence(events, 0)
-                
-                # while True:  # approval loop
-                #     global approval_result
-                #     print("WAITING FOR APPROVAL...")
-                #     with approval_lock:
-                #         approval_result = None  # reset before waiting
-                #     accepting_approval.set()
+                    if (recording_done.is_set()):
+                        phrase_num += 1
+                        if (phrase_num == 1):
+                            play_midi_track('CDL_1.mid')
+                            break
+                        elif (phrase_num == 2):
+                            play_midi_track('CDL_2.mid')
+                            break
 
-                #     # Wait for approval signal
-                #     while True:
-                #         with approval_lock:
-                #             if approval_result is not None:
-                #                 result = approval_result
-                #                 approval_result = None
-                #                 break
-                #         time.sleep(0.05)
-
-                #     if result == 0:
-                #         print("!!DISLIKED - PLAYING AGAIN")
-                #         play_sequence(events, temperature=1.0)
-                #     elif result == 1:
-                #         print("!!LIKED IT")
-                #         shimon_nod()
-                #         break  # exit approval loop (nod detected)
-                
-                play_midi_track('CDL_1.mid')    
-                
-                
-                events.clear()
-                i = 0
                 recording_done.clear()
                 accepting_eye_contact.clear()
-                accepting_approval.clear()
                 print("READY FOR NEXT PHRASE")
-                break                
-            
+                break
         except KeyboardInterrupt:
             exit()
 
+  
 def tempo_detect():
     global tempo
     print("Waiting for tempo from nods...")
@@ -272,6 +292,14 @@ def tempo_detect():
     
     print(f"Tempo confirmed: {bpm:.1f} BPM — starting head movement")
     tempo_detection_enabled.clear()
+    
+    try:
+        send_to_max("/tempo", bpm)
+        send_to_max("/status", 1)
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        send_to_max("/status", 0)
 
 def render_midi_at_tempo(input_filename, output_filename, track_index=1):
     """
@@ -335,7 +363,6 @@ def play_midi_track(input_filename, track_index=1):
             print(f"🎹 Note {note} vel {velocity}")
 
     print("✅ Playback complete.")
-    accepting_approval.set()
     look_left()
 
     
@@ -439,11 +466,20 @@ if __name__ == "__main__":
     ports = midi_in.get_ports()
     print("Available ports:", ports)
     
-    send_to_max("/tempo", 120)
-    send_to_max("/status", 1)
+    # send_to_max("/tempo", 120)
+    # send_to_max("/status", 1)
 
     # Ask user to choose a port
     port_index = int(input("Select input port number: "))
+    part_1_flag = int(input("Select call-and-response (0) or turn-taking (1): "))
+    if (part_1_flag == 0):
+        print("------------------------------")
+        print("------------ CALL AND RESPONSE")
+        print("------------------------------")
+    elif (part_1_flag == 1):
+        print("------------------------------")
+        print("------------------ TURN TAKING")
+        print("------------------------------")
 
     start_gestures_monitor(on_eye_contact, on_approval_detected, on_tempo_detected)
     
@@ -462,8 +498,6 @@ if __name__ == "__main__":
     tempo_detect()
     
     look_forward()
-    
-    shimon_synced()
     
     look_forward()
         
