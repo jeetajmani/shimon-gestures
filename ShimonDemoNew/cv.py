@@ -16,14 +16,16 @@ SHOW_WINDOW = False
 # head_client = udp_client.SimpleUDPClient("192.168.1.1", 9000)
 
 # Parameters
-WINDOW_SIZE = 30                 # number of recent frames to analyze
-NOD_THRESHOLD = 2.5            # vertical movement amplitude threshold
-SHAKE_THRESHOLD = 2.5           # horizontal movement amplitude threshold
-MOVEMENT_RATIO_THRESHOLD = 0.6   # ratio of frames that must show motion
+WINDOW_SIZE = 15                  # number of recent frames to analyze
+NOD_THRESHOLD = 1.5               # vertical movement amplitude threshold
+SHAKE_THRESHOLD = 1.5             # horizontal movement amplitude threshold
+MOVEMENT_RATIO_THRESHOLD = 0.4    # ratio of frames that must show motion
+DELTA_THRESHOLD = 0.5             # per-frame delta threshold
+ZC_THRESHOLD = 1                  # zero-crossing threshold
 
 # Buffers for smoothing
-x_positions = deque(maxlen=WINDOW_SIZE)
-y_positions = deque(maxlen=WINDOW_SIZE)
+pitches = deque(maxlen=WINDOW_SIZE)
+yaws = deque(maxlen=WINDOW_SIZE)
 
 # pitch_vals = deque(maxlen=WINDOW_SIZE)
 # yaw_vals = deque(maxlen=WINDOW_SIZE)
@@ -74,7 +76,7 @@ def get_head_angles(face_landmarks):
     lm = face_landmarks.landmark
 
     # Key points
-    nose = np.array([lm[1].x, lm[1].y, lm[1].z])
+    # nose = np.array([lm[1].x, lm[1].y, lm[1].z])
     left_eye = np.array([lm[33].x, lm[33].y, lm[33].z])
     right_eye = np.array([lm[263].x, lm[263].y, lm[263].z])
     chin = np.array([lm[152].x, lm[152].y, lm[152].z])
@@ -144,12 +146,13 @@ def is_thumbs_down(pts):
     return th_ext and upness < -0.35
 
 def detect_motion_state():
-    """Return 'Idle', 'Nodding', or 'Shaking' based on recent nose motion."""
-    if len(x_positions) < WINDOW_SIZE:
+    """Return 'Idle', 'Nodding', or 'Shaking' based on head angle motion."""
+    # Only start once we have at least half a window
+    if len(pitches) < WINDOW_SIZE // 2:
         return "Idle"
 
-    x = np.array(x_positions)
-    y = np.array(y_positions)
+    x = np.array(yaws)
+    y = np.array(pitches)
     
     def smooth(signal, window=5):
         if len(signal) < window:
@@ -157,42 +160,49 @@ def detect_motion_state():
         kernel = np.ones(window) / window
         return np.convolve(signal, kernel, mode='same')
 
+    # Smooth signals a bit
     x = smooth(x)
     y = smooth(y)
 
     # Center signals around zero
-    x -= np.mean(x)
-    y -= np.mean(y)
+    x = x - np.mean(x)
+    y = y - np.mean(y)
 
-    # Compute per-frame deltas (movement magnitude)
+    # Per-frame motion
     dx = np.abs(np.diff(x))
     dy = np.abs(np.diff(y))
 
-    # Compute percentage of frames with noticeable motion
-    moving_x_ratio = np.mean(dx > 1.0)
-    moving_y_ratio = np.mean(dy > 1.0)
+    moving_x_ratio = np.mean(dx > DELTA_THRESHOLD)
+    moving_y_ratio = np.mean(dy > DELTA_THRESHOLD)
 
-    # Compute movement amplitude (std deviation)
+    # Overall amplitude
     x_std = np.std(x)
     y_std = np.std(y)
 
-    # Count zero crossings (oscillations)
+    # Oscillations (zero crossings)
     def zero_crossings(signal):
         return np.count_nonzero(np.diff(np.sign(signal)))
 
     x_zc = zero_crossings(x)
     y_zc = zero_crossings(y)
 
-    # Detect based on amplitude, consistency, and oscillation
+    # Debug prints if you want:
+    # print(f"x_std={x_std:.2f}, y_std={y_std:.2f}, "
+    #       f"x_zc={x_zc}, y_zc={y_zc}, "
+    #       f"mx={moving_x_ratio:.2f}, my={moving_y_ratio:.2f}")
+
     is_nodding = (
         y_std > NOD_THRESHOLD
-        and y_zc > 4
+        and y_zc >= ZC_THRESHOLD
         and moving_y_ratio > MOVEMENT_RATIO_THRESHOLD
+        and y_std > x_std * 0.8   # mostly vertical
     )
+
     is_shaking = (
         x_std > SHAKE_THRESHOLD
-        and x_zc > 4
+        and x_zc >= ZC_THRESHOLD
         and moving_x_ratio > MOVEMENT_RATIO_THRESHOLD
+        and x_std > y_std * 0.8   # mostly horizontal
     )
 
     if is_nodding and not is_shaking:
@@ -318,15 +328,11 @@ def start_gestures_monitor(on_eye_contact_callback, on_approval_callback, on_tem
             # APPROVAL DETECTION - NOD/SHAKE
             if face_results.multi_face_landmarks:
                 face_landmarks = face_results.multi_face_landmarks[0]
-                h, w, _ = image.shape
 
-                # Nose tip landmark index = 1
-                nose_tip = face_landmarks.landmark[1]
-                x = nose_tip.x * w
-                y = nose_tip.y * h
+                pitch, yaw = get_head_angles(face_landmarks)
 
-                x_positions.append(x)
-                y_positions.append(y)
+                pitches.append(pitch)
+                yaws.append(yaw)
                 
                 state = detect_motion_state()
                 
