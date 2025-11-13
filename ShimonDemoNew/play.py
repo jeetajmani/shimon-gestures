@@ -39,10 +39,16 @@ def send_gesture_to_shimon(part, pos, vel, host="192.168.1.1", port=9000):
 def look_left():
     send_gesture_to_shimon("BASEPAN", -0.7, 5)
     send_gesture_to_shimon("NECK", -0.2, 10)
+    send_gesture_to_shimon("HEADTILT", 0, 8)
     
 def look_forward():
     send_gesture_to_shimon("BASEPAN", 0, 5)
     send_gesture_to_shimon("NECK", 0.2, 10)
+
+def shimon_sad():
+    send_gesture_to_shimon("NECK", -0.4, 7)
+    send_gesture_to_shimon("HEADTILT", -1.2, 8)
+    send_gesture_to_shimon("BASEPAN", 0, 5)
 
 def shimon_nod():
     send_gesture_to_shimon("NECK", 0.3, 10)
@@ -146,10 +152,9 @@ def process_midi_phrase_dict(events, temperature: float = 1.0):
 
     return events
 
-def play_sequence(events, temperature):
+def play_sequence(events, temperature=1.0):
     events = process_midi_phrase_dict(events, temperature=temperature)
     recording_done.clear()
-    look_forward()
     events[0]["delta"] = 0.01
     for event in events:
         time.sleep(event["delta"])
@@ -227,7 +232,8 @@ def keyboard_phrase(port_index):
                 if (recording_done.is_set()):
                     print("ALL DONE")
 
-                    play_sequence(events, 0)
+                    look_forward()
+                    play_sequence(events, 1.0)
                     
                     while True:  # approval loop
                         global approval_result
@@ -247,7 +253,8 @@ def keyboard_phrase(port_index):
 
                         if result == 0:
                             print("!!DISLIKED - PLAYING AGAIN")
-                            play_sequence(events, temperature=1.0)
+                            shimon_sad()
+                            play_sequence(events, temperature=0.5)
                         elif result == 1:
                             print("!!LIKED IT")
                             shimon_nod()
