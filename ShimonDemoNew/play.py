@@ -6,6 +6,7 @@ from cv import tempo_detection_enabled
 import threading
 import numpy as np
 import mido
+import copy
 
 accepting_eye_contact = threading.Event()
 shimon_turn = False
@@ -24,18 +25,25 @@ phrase_num = 0
 
 NOTE_LATENCY = 0.5
 
-def send_to_max(message, value, host="127.0.0.1", port=7402):
-    client = udp_client.SimpleUDPClient(host, port)
-    client.send_message(message, value)
+basepan_pos = None
+neck_pos = None
+headtile_pos = None
 
-def send_note_to_shimon(note, velocity, host="192.168.1.1", port=9010):
-    client = udp_client.SimpleUDPClient(host, port)
-    client.send_message("/arm", [note, velocity])
+temperature = 0.75
 
-def send_gesture_to_shimon(part, pos, vel, host="192.168.1.1", port=9000):
-    client = udp_client.SimpleUDPClient(host, port)
-    client.send_message("/head-commands", [part, pos, vel])
+SHIMON_ARM = udp_client.SimpleUDPClient("192.168.1.1", 9010)
+SHIMON_HEAD = udp_client.SimpleUDPClient("192.168.1.1", 9000)
+MAX_CLIENT = udp_client.SimpleUDPClient("127.0.0.1", 7402)
 
+def send_to_max(message, value):
+    MAX_CLIENT.send_message(message, value)
+
+def send_note_to_shimon(note, velocity):
+    SHIMON_ARM.send_message("/arm", [note, velocity])
+
+def send_gesture_to_shimon(part, pos, vel):
+    SHIMON_HEAD.send_message("/head-commands", [part, pos, vel])
+    
 def look_left():
     send_gesture_to_shimon("BASEPAN", -0.7, 5)
     send_gesture_to_shimon("NECK", -0.2, 10)
@@ -43,7 +51,7 @@ def look_left():
     
 def look_forward():
     send_gesture_to_shimon("BASEPAN", 0, 5)
-    send_gesture_to_shimon("NECK", 0.2, 10)
+    send_gesture_to_shimon("NECK", 0.0, 10)
 
 def shimon_sad():
     send_gesture_to_shimon("NECK", -0.4, 7)
@@ -57,49 +65,10 @@ def shimon_nod():
     
     send_gesture_to_shimon("NECK", -0.3, 10)
     send_gesture_to_shimon("HEADTILT", 0.4, 20)
-    
-# def process_midi_phrase_dict(events, temperature: float = 1.0):
-#     """
-#     Randomly alters the notes in a MIDI phrase (list of dicts)
-#     according to a temperature parameter between 0 and 1.
-
-#     Only swaps notes that have non-zero velocity.
-#     """
-#     temperature = np.clip(temperature, 0, 1)
-
-#     # Collect indices of notes with non-zero velocity
-#     active_indices = [i for i, e in enumerate(events) if e["velocity"] > 0]
-#     n_events = len(active_indices)
-#     if n_events == 0:
-#         return events
-
-#     # Determine how many to modify (scaled by temperature)
-#     n_to_change = int(np.random.randint(0, max(1, int(n_events * temperature))))
-#     if n_to_change == 0:
-#         return events
-
-#     # Weighted probability (notes near center more likely to change)
-#     w = np.hanning(n_events) + 1e-6
-#     p = w / np.sum(w)
-
-#     # Choose indices among active notes
-#     change_indices = np.random.choice(active_indices, n_to_change, replace=False, p=p)
-
-#     # Unique playable pitches (non-zero velocity only)
-#     all_notes = np.array([e["note"] for e in events if e["velocity"] > 0])
-#     unique_notes = np.unique(all_notes)
-
-#     # Perform swaps
-#     for i in change_indices:
-#         old_note = events[i]["note"]
-#         new_note = int(np.random.choice(unique_notes))
-#         events[i]["note"] = new_note
-#         print(f"Changed note {old_note} → {new_note} at index {i}")
-
-#     return events
+    time.sleep(0.3)
 
 ## NEW TEMPERATURE FUNCTION
-def process_midi_phrase_dict(events, temperature: float = 1.0):
+def process_midi_phrase_dict(events, temperature):
     """
     Randomly alters the notes in a MIDI phrase (list of dicts)
     according to a temperature parameter between 0 and 1.
@@ -133,7 +102,6 @@ def process_midi_phrase_dict(events, temperature: float = 1.0):
     # Perform swaps
     for i in change_indices:
         old_note = events[i]["note"]
-        old_note = events[i]["note"]
         
         # scale maximum step by temperature (0-12 semitones)
         max_step = max(1, int(np.ceil(12 * temperature)))
@@ -142,18 +110,15 @@ def process_midi_phrase_dict(events, temperature: float = 1.0):
         new_note = int(old_note + direction * steps)
 
         # keep note in a playable range (48..95) by octave-shifting if necessary
-        while new_note < 48:
-            new_note += 12
-        while new_note > 95:
-            new_note -= 12
+        new_note = ((new_note - 48) % 48) + 48
 
         events[i]["note"] = new_note
         print(f"Changed note {old_note} → {new_note} at index {i}")
 
     return events
 
-def play_sequence(events, temperature=1.0):
-    events = process_midi_phrase_dict(events, temperature=temperature)
+def play_sequence(events, temperature):
+    events = process_midi_phrase_dict(events, temperature)
     recording_done.clear()
     events[0]["delta"] = 0.01
     for event in events:
@@ -185,17 +150,17 @@ def on_approval_detected(direction):
         print('cant look at approval~ yet')
 
 def on_tempo_detected(detected_tempo):
+    """Called by cv.py whenever a valid tempo burst is detected."""
     global tempo
-    if (accepting_tempo.is_set()):
-        with tempo_lock:
-            tempo = detected_tempo
-        print(f"🎵 Detected nod tempo: {tempo:.1f} BPM")
-        accepting_tempo.clear()
-    else:
-        print('Cant detect tempo yet!')
+    with tempo_lock:
+        tempo = detected_tempo
+    print(f"🎵 Detected nod tempo: {tempo:.1f} BPM")
+
         
 def keyboard_phrase(port_index):
     global phrase_num
+    global temperature
+    temperature = 0.75
     print("KEYBOARD SEND")
     
     events = []
@@ -228,18 +193,19 @@ def keyboard_phrase(port_index):
                     if (len(events) >= 5):
                         print("NOW WE CAN SEE")
                         accepting_eye_contact.set()
+                else:
+                    time.sleep(0.001)
                     
                 if (recording_done.is_set()):
                     print("ALL DONE")
-
+                    events_original = copy.deepcopy(events)
                     look_forward()
-                    play_sequence(events, 1.0)
+                    play_sequence(events, temperature)
                     
                     while True:  # approval loop
                         global approval_result
                         print("WAITING FOR APPROVAL...")
-                        with approval_lock:
-                            approval_result = None  # reset before waiting
+                        approval_result = None  # reset before waiting
                         accepting_approval.set()
 
                         # Wait for approval signal
@@ -254,7 +220,8 @@ def keyboard_phrase(port_index):
                         if result == 0:
                             print("!!DISLIKED - PLAYING AGAIN")
                             shimon_sad()
-                            play_sequence(events, temperature=0.5)
+                            events_mod = copy.deepcopy(events_original)
+                            play_sequence(events_mod, temperature/2)
                         elif result == 1:
                             print("!!LIKED IT")
                             shimon_nod()
@@ -285,64 +252,52 @@ def keyboard_phrase(port_index):
                 print("READY FOR NEXT PHRASE")
                 break
         except KeyboardInterrupt:
+            look_forward()
             exit()
-
   
 def tempo_detect():
     global tempo
     print("Waiting for tempo from nods...")
-    while True:
+
+    # Make sure tempo mode is enabled on the CV side
+    tempo_detection_enabled.set()
+
+    # Clear any stale tempo
+    with tempo_lock:
+        tempo = None
+
+    # --- FIRST TEMPO ---
+    bpm = None
+    while bpm is None:
         with tempo_lock:
             if tempo is not None:
                 bpm = tempo
-                break
-    
+                tempo = None
+        time.sleep(0.01)
+
     print(f"Tempo confirmed: {bpm:.1f} BPM — starting head movement")
-    tempo_detection_enabled.clear()
-    
+
     try:
         send_to_max("/tempo", bpm)
         send_to_max("/status", 1)
+
+        print("\n-------------")
+        print("LIVE TEMPO MODE: Nod 4+ times to set new tempo")
+        print("-------------")
+
+        # --- CONTINUOUS UPDATES ---
         while True:
-            time.sleep(1)
+            with tempo_lock:
+                if tempo is not None:
+                    bpm = tempo
+                    tempo = None
+                    send_to_max("/tempo", bpm)
+                    print(f"🎛 LIVE TEMPO UPDATED → {bpm} BPM")
+            time.sleep(0.01)
+
     except KeyboardInterrupt:
         send_to_max("/status", 0)
-
-def render_midi_at_tempo(input_filename, output_filename, track_index=1):
-    """
-    Extracts a single track from a MIDI file and writes a new file
-    that plays at the specified BPM, ignoring internal tempo changes.
-
-    Keeps the chosen track only, with its original delta timing.
-    """
-    global tempo
-    
-    mid = mido.MidiFile(input_filename)
-    ppq = mid.ticks_per_beat
-    seconds_per_beat = 60.0 / tempo
-    us_per_beat = int(seconds_per_beat * 1_000_000)
-
-    if track_index >= len(mid.tracks):
-        raise IndexError(f"MIDI only has {len(mid.tracks)} tracks (0–{len(mid.tracks)-1})")
-
-    print(f"🎼 Extracting Track {track_index} from '{input_filename}'")
-    print(f"Target tempo: {tempo:.1f} BPM | PPQ = {ppq}")
-
-    new_mid = mido.MidiFile(ticks_per_beat=ppq)
-    new_track = mido.MidiTrack()
-    new_mid.tracks.append(new_track)
-
-    # Add your target tempo message at start
-    new_track.append(mido.MetaMessage("set_tempo", tempo=us_per_beat, time=0))
-
-    # Copy only messages from the selected track, ignoring any tempo events
-    for msg in mid.tracks[track_index]:
-        if msg.is_meta and msg.type == "set_tempo":
-            continue
-        new_track.append(msg.copy())
-
-    new_mid.save(output_filename)
-    print(f"✅ Saved: {output_filename}")
+        look_forward()
     
 def play_midi_track(input_filename, track_index=1):
     """Plays a MIDI file at its original tempo and sends notes to Shimon."""
@@ -412,69 +367,11 @@ def move_neck_and_head():
             beat_count += 1
             next_beat += beat_interval  # <— fixed here
 
-def shimon_synced():
-    # note_thread = threading.Thread(target=play_notes, daemon=True)
-    note_thread = threading.Thread(target=play_midi_track, args=("furelise.mid",), daemon=True)
-    neck_thread = threading.Thread(target=move_neck_and_head, daemon=True)
-    note_thread.start()
-    time.sleep(0.5)
-    neck_thread.start()
-    
-    while True:
-        time.sleep(1)
-
-# def shimon_move_to_tempo():
-#     global tempo
-#     beat_interval = 60.0 / tempo
-#     half_beat = beat_interval / 2.0
-    
-#     t0 = time.monotonic()
-#     next_beat = t0
-#     beat_count = 0
-#     neck_direction = 1
-    
-#     note_triggered = False
-    
-#     while True:
-#         now = time.monotonic()
-        
-#         if not note_triggered and (next_beat - now) <= NOTE_LATENCY:
-#             note = int(np.random.randint(48, 96))  # inclusive 48–95
-#             send_note_to_shimon(note, 68)
-#             print(f"Triggered note {note}")
-#             # send_note_to_shimon(59, 68)
-#             note_triggered = True
-        
-#         if now >= next_beat:
-#             note_triggered = False
-            
-#             # Downward motion
-#             neck_pos = 0.1 * neck_direction
-#             send_gesture_to_shimon("NECK", neck_pos, 15)
-#             neck_direction *= -1
-            
-#             send_gesture_to_shimon("HEADTILT", -0.2, 20)
-
-#             # Schedule the 'up' event halfway through this beat
-#             up_time = next_beat + half_beat
-
-#             # Move head back up exactly halfway through the beat
-#             while time.monotonic() < up_time:
-#                 time.sleep(0.001)  # tiny wait to hold timing accuracy
-
-#             send_gesture_to_shimon("HEADTILT", 0.2, 20)
-
-#             beat_count += 1
-#             next_beat = t0 + beat_count * beat_interval
-    
 if __name__ == "__main__":
     # List all available MIDI input ports
     midi_in = rtmidi.MidiIn()
     ports = midi_in.get_ports()
     print("Available ports:", ports)
-    
-    # send_to_max("/tempo", 120)
-    # send_to_max("/status", 1)
 
     # Ask user to choose a port
     port_index = int(input("Select input port number: "))
@@ -492,7 +389,6 @@ if __name__ == "__main__":
     
     for i in range(2):
         look_left()
-    
         keyboard_phrase(port_index)
         
     look_left()
@@ -503,9 +399,3 @@ if __name__ == "__main__":
     print("------------------------------")
 
     tempo_detect()
-    
-    look_forward()
-    
-    look_forward()
-        
-        
