@@ -40,6 +40,18 @@
 		"assistshowspatchername" : 0,
 		"boxes" : [ 			{
 				"box" : 				{
+					"id" : "obj-377",
+					"maxclass" : "message",
+					"numinlets" : 2,
+					"numoutlets" : 1,
+					"outlettype" : [ "" ],
+					"patching_rect" : [ 398.0, 725.419355034828186, 29.5, 22.0 ],
+					"text" : "3"
+				}
+
+			}
+, 			{
+				"box" : 				{
 					"id" : "obj-374",
 					"maxclass" : "newobj",
 					"numinlets" : 1,
@@ -137,18 +149,6 @@
 			}
 , 			{
 				"box" : 				{
-					"id" : "obj-352",
-					"maxclass" : "newobj",
-					"numinlets" : 2,
-					"numoutlets" : 1,
-					"outlettype" : [ "float" ],
-					"patching_rect" : [ 613.0, 485.0, 44.5, 22.0 ],
-					"text" : "f 18"
-				}
-
-			}
-, 			{
-				"box" : 				{
 					"id" : "obj-335",
 					"maxclass" : "message",
 					"numinlets" : 2,
@@ -239,7 +239,7 @@
 					"numoutlets" : 1,
 					"outlettype" : [ "" ],
 					"patching_rect" : [ 655.0, 1178.0, 50.0, 22.0 ],
-					"text" : "4.1"
+					"text" : "3."
 				}
 
 			}
@@ -547,7 +547,7 @@
 					"numoutlets" : 1,
 					"outlettype" : [ "" ],
 					"patching_rect" : [ 1701.0, 374.27131974697113, 50.0, 22.0 ],
-					"text" : "1"
+					"text" : "2"
 				}
 
 			}
@@ -761,8 +761,8 @@
 					"numinlets" : 2,
 					"numoutlets" : 1,
 					"outlettype" : [ "" ],
-					"patching_rect" : [ 7.0, 460.0, 82.0, 22.0 ],
-					"text" : "write blues.txt"
+					"patching_rect" : [ 7.0, 460.0, 34.0, 22.0 ],
+					"text" : "write"
 				}
 
 			}
@@ -2060,6 +2060,15 @@
 , 			{
 				"patchline" : 				{
 					"destination" : [ "obj-153", 0 ],
+					"order" : 1,
+					"source" : [ "obj-150", 0 ]
+				}
+
+			}
+, 			{
+				"patchline" : 				{
+					"destination" : [ "obj-377", 0 ],
+					"order" : 0,
 					"source" : [ "obj-150", 0 ]
 				}
 
@@ -2710,6 +2719,13 @@
 			}
 , 			{
 				"patchline" : 				{
+					"destination" : [ "obj-369", 0 ],
+					"source" : [ "obj-377", 0 ]
+				}
+
+			}
+, 			{
+				"patchline" : 				{
 					"destination" : [ "obj-12", 0 ],
 					"source" : [ "obj-4", 0 ]
 				}
@@ -2977,7 +2993,8 @@
  ],
 		"dependency_cache" : [ 			{
 				"name" : "blues.txt",
-				"bootpath" : "C74:/help/max",
+				"bootpath" : "~/Downloads",
+				"patcherrelativepath" : ".",
 				"type" : "TEXT",
 				"implicit" : 1
 			}
