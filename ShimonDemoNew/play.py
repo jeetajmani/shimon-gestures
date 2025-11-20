@@ -20,6 +20,8 @@ accepting_tempo = threading.Event()
 tempo = None
 tempo_lock = threading.Lock()
 
+sad_gesture_stop = threading.Event()
+
 part_1_flag = -1
 phrase_num = 0
 
@@ -30,6 +32,8 @@ neck_pos = None
 headtile_pos = None
 
 temperature = 0.75
+
+free_play = False
 
 SHIMON_ARM = udp_client.SimpleUDPClient("192.168.1.1", 9010)
 SHIMON_HEAD = udp_client.SimpleUDPClient("192.168.1.1", 9000)
@@ -45,18 +49,40 @@ def send_gesture_to_shimon(part, pos, vel):
     SHIMON_HEAD.send_message("/head-commands", [part, pos, vel])
     
 def look_left():
-    send_gesture_to_shimon("BASEPAN", -0.7, 5)
+    send_gesture_to_shimon("BASEPAN", -0.675, 5)
     send_gesture_to_shimon("NECK", -0.2, 10)
     send_gesture_to_shimon("HEADTILT", 0, 8)
+    idle(1)
     
 def look_forward():
+    idle(0)
     send_gesture_to_shimon("BASEPAN", 0, 5)
     send_gesture_to_shimon("NECK", 0.0, 10)
 
 def shimon_sad():
-    send_gesture_to_shimon("NECK", -0.4, 7)
-    send_gesture_to_shimon("HEADTILT", -1.2, 8)
-    send_gesture_to_shimon("BASEPAN", 0, 5)
+    """Modified to be interruptible"""
+    sad_gesture_stop.clear()
+    
+    idle(0)
+    send_gesture_to_shimon("NECK", -0.4, 10)
+    send_gesture_to_shimon("HEADTILT", -1.0, 15)
+    
+    if sad_gesture_stop.wait(1.0):  # Interruptible sleep
+        return
+ 
+    for _ in range(100):
+        send_gesture_to_shimon("BASEPAN", -1.0, 3)
+        if sad_gesture_stop.wait(0.5):
+            return
+        send_gesture_to_shimon("BASEPAN", 0.0, 3)
+        if sad_gesture_stop.wait(0.5):
+            return
+        send_gesture_to_shimon("BASEPAN", 1.0, 3)
+        if sad_gesture_stop.wait(0.5):
+            return
+ 
+    if sad_gesture_stop.wait(0.7):
+        return   
 
 def shimon_nod():
     send_gesture_to_shimon("NECK", 0.3, 10)
@@ -66,6 +92,9 @@ def shimon_nod():
     send_gesture_to_shimon("NECK", -0.3, 10)
     send_gesture_to_shimon("HEADTILT", 0.4, 20)
     time.sleep(0.3)
+
+def idle(status):   
+    send_to_max("/idle", status)
 
 ## NEW TEMPERATURE FUNCTION
 def process_midi_phrase_dict(events, temperature):
@@ -128,6 +157,7 @@ def play_sequence(events, temperature):
             send_note_to_shimon(event["note"], 120)
             print(f"Sent: {event}")
     
+    sad_gesture_stop.set()
     accepting_approval.set()
     look_left()
 
@@ -139,6 +169,9 @@ def on_eye_contact():
     else:
         print('cant start yet')
         
+    if free_play:
+        send_to_max("/eyes", 1)
+        
 def on_approval_detected(direction):
     global approval_result
     if (accepting_approval.is_set() and not shimon_turn):
@@ -148,7 +181,17 @@ def on_approval_detected(direction):
         accepting_approval.clear()
     else:
         print('cant look at approval~ yet')
-
+        
+    if free_play:
+        print("FREEEEEEEE")
+        with approval_lock:
+            if approval_result is not None:
+                result = approval_result
+                if result == 0:
+                    send_to_max("/eyes", 0)
+                    accepting_approval.set()
+                approval_result = None
+        
 def on_tempo_detected(detected_tempo):
     """Called by cv.py whenever a valid tempo burst is detected."""
     global tempo
@@ -219,7 +262,8 @@ def keyboard_phrase(port_index):
 
                         if result == 0:
                             print("!!DISLIKED - PLAYING AGAIN")
-                            shimon_sad()
+                            sad_thread = threading.Thread(target=shimon_sad, daemon=True)
+                            sad_thread.start()
                             events_mod = copy.deepcopy(events_original)
                             play_sequence(events_mod, temperature/2)
                         elif result == 1:
@@ -257,6 +301,7 @@ def keyboard_phrase(port_index):
   
 def tempo_detect():
     global tempo
+    global free_play
     print("Waiting for tempo from nods...")
 
     # Make sure tempo mode is enabled on the CV side
@@ -276,13 +321,15 @@ def tempo_detect():
         time.sleep(0.01)
 
     print(f"Tempo confirmed: {bpm:.1f} BPM — starting head movement")
-
+    idle(0)
+    free_play = True
+    accepting_approval.set()
     try:
         send_to_max("/tempo", bpm)
         send_to_max("/status", 1)
 
         print("\n-------------")
-        print("LIVE TEMPO MODE: Nod 4+ times to set new tempo")
+        print("LIVE TEMPO MODE: Nod 3 times to set new tempo")
         print("-------------")
 
         # --- CONTINUOUS UPDATES ---

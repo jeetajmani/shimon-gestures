@@ -25,10 +25,10 @@ SHAKE_RIGHT_THR = +10     # yaw angle right
 SHAKE_DEBOUNCE  = 1.0     # seconds required between shakes
 
 # Tempo nod thresholds (lighter/faster)
-TEMPO_DOWN_THR = -7
-TEMPO_UP_THR   = -1
-TEMPO_MIN_NODS = 4
-TEMPO_WINDOW_SEC = 2.5
+TEMPO_DOWN_THR = -5
+TEMPO_UP_THR   = -0.5
+TEMPO_MIN_NODS = 3
+TEMPO_WINDOW_SEC = 3.45
 
 # Buffers
 pitches = deque(maxlen=WINDOW_SIZE)
@@ -129,7 +129,6 @@ def start_gestures_monitor(on_eye_contact_callback,
         nodding = False
 
         # Shake state
-        shaking = False
         last_shake_time = 0
         shake_stage = None  # "L" → "R" → "L" OR "R" → "L" → "R"
 
