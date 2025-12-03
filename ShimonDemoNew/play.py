@@ -8,6 +8,7 @@ import numpy as np
 import mido
 import copy
 from collections import deque
+import cv2  # <--- NEW: for optical flow
 
 accepting_eye_contact = threading.Event()
 shimon_turn = False
@@ -49,6 +50,128 @@ MAX_CLIENT = udp_client.SimpleUDPClient("127.0.0.1", 7402)
 
 def send_to_max(message, value):
     MAX_CLIENT.send_message(message, value)
+
+# =========================
+# OPTICAL FLOW MOTION INPUT
+# =========================
+
+# --- Tunables (copied / adapted from your optical-flow script) ---
+RESIZE_FACTOR = 0.5
+
+FLOW_NORMALIZE = 1.5        # magnitude that maps to 100
+MAX_FLOW_DISPLAY = 100.0
+
+BASELINE_FLOOR = 0.12       # dead-zone for tiny noise
+
+USE_PERCENTILE = True
+PERCENTILE = 90
+
+COMPUTE_EVERY_N = 3         # compute flow 1 out of N frames
+
+WINDOW_SIZE = 5             # smoothing window for displayed value
+
+PRINT_INTERVAL_SEC = 1.0    # print motion once per second
+
+# --- State for optical flow thread ---
+flow_history = deque(maxlen=WINDOW_SIZE)
+last_flow_value = 0.0
+sum_since_print = 0.0
+count_since_print = 0
+last_print_ts = time.time()
+frame_idx = 0
+
+# This is the shared "how much the player is moving" signal: 0..1
+motion_intensity = 0.0
+motion_lock = threading.Lock()
+
+
+def optical_flow_loop():
+    """
+    Background thread:
+    - Reads from webcam
+    - Computes dense optical flow every N frames
+    - Produces a motion_intensity in [0, 1]
+    which is used by nod_loop to scale how far up/down Shimon moves.
+    """
+    global last_flow_value, sum_since_print, count_since_print
+    global last_print_ts, frame_idx, motion_intensity
+
+    cap = cv2.VideoCapture(0)
+    ret, prev_frame = cap.read()
+    if not ret:
+        print("[OPTICAL FLOW] Failed to grab initial frame")
+        return
+
+    prev_small = cv2.resize(prev_frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+    prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
+
+    print("[OPTICAL FLOW] Started. Using webcam 0 for motion intensity.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[OPTICAL FLOW] Frame grab failed, stopping.")
+            break
+
+        frame_small = cv2.resize(frame, (0, 0), fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+
+        computed_this_frame = False
+        if frame_idx % COMPUTE_EVERY_N == 0:
+            # --- Dense optical flow (Farneback) ---
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, gray, None,
+                pyr_scale=0.5, levels=2, winsize=10,
+                iterations=2, poly_n=5, poly_sigma=1.1, flags=0
+            )
+
+            # --- Motion measure ---
+            mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            if USE_PERCENTILE:
+                flow_measure = np.percentile(mag, PERCENTILE)
+            else:
+                flow_measure = np.mean(mag)
+
+            # --- Raise the floor (dead-zone) ---
+            flow_measure = max(flow_measure - BASELINE_FLOOR, 0.0)
+
+            # --- Normalize to 0–100 and smooth lightly ---
+            flow_value = min((flow_measure / FLOW_NORMALIZE) * 100.0, MAX_FLOW_DISPLAY)
+            flow_history.append(flow_value)
+            last_flow_value = float(np.mean(flow_history))
+
+            prev_gray = gray
+            computed_this_frame = True
+
+            # Accumulate for 1-second average print
+            sum_since_print += last_flow_value
+            count_since_print += 1
+
+            # Map to [0, 1] for motion_intensity
+            norm_intensity = min(last_flow_value / MAX_FLOW_DISPLAY, 1.0)
+
+            with motion_lock:
+                motion_intensity = norm_intensity
+
+        # --- Print average once per second ---
+        now = time.time()
+        if now - last_print_ts >= PRINT_INTERVAL_SEC:
+            if count_since_print > 0:
+                avg_last_sec = sum_since_print / count_since_print
+                print(f"[OPTICAL FLOW] avg (last {PRINT_INTERVAL_SEC:.0f}s): {avg_last_sec:.1f}/100")
+            sum_since_print = 0.0
+            count_since_print = 0
+            last_print_ts = now
+
+        frame_idx += 1
+
+        # No cv2.imshow / waitKey here to keep this thread headless.
+        # If you want a debug window, you can add imshow + waitKey
+        # but GUI-from-thread can be finicky on some systems.
+
+    cap.release()
+    print("[OPTICAL FLOW] Stopped.")
+
 
 ## NEW nod at playing tempo helper
 def normalize_ioi_to_beat(dt, min_bpm=60.0, max_bpm=150.0):
@@ -124,6 +247,10 @@ def nod_loop(idle_timeout=2.0):
 
     - Tempo is recomputed from the last 6 events (via update_nod_tempo_from_delta).
     - If there are no events for > idle_timeout seconds, nodding pauses.
+
+    NOW ALSO:
+    - Uses motion_intensity from optical_flow_loop to scale how far up/down
+      Shimon moves. More player motion -> bigger nod amplitude.
     """
     global nod_bpm, last_event_ts
 
@@ -157,12 +284,23 @@ def nod_loop(idle_timeout=2.0):
             continue
 
         if now >= next_nod_time:
-            print(f"[NOD] ~{bpm:.1f} BPM")  # simple text 
+            # Get motion-based amplitude factor in [0, 1]
+            with motion_lock:
+                intensity = motion_intensity
+
+            # Map intensity to a neck amplitude: e.g. 0.05..0.25
+            # (small nods when player is still, bigger when moving a lot)
+            base_amp = 0.05
+            extra_amp = 0.20
+            amp = base_amp + extra_amp * intensity
+
+            print(f"[NOD] ~{bpm:.1f} BPM, amp={amp:.3f}, mot={intensity:.2f}")
+
             if nod_up:
-                send_gesture_to_shimon("NECK", 0.1, 10)
+                send_gesture_to_shimon("NECK", amp, 10)
                 nod_up = False
             else:
-                send_gesture_to_shimon("NECK", -0.1, 10)
+                send_gesture_to_shimon("NECK", -amp, 10)
                 nod_up = True
 
             # Re-read bpm each time so nod spacing adapts if tempo changed
@@ -576,6 +714,9 @@ if __name__ == "__main__":
 
     # NEW: start background nod thread (delta-based tempo)
     threading.Thread(target=nod_loop, daemon=True).start()
+
+    # NEW: start background optical flow thread (motion -> nod amplitude)
+    threading.Thread(target=optical_flow_loop, daemon=True).start()
     
     for i in range(2):
         look_left()
