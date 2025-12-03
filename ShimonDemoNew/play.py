@@ -129,6 +129,8 @@ def nod_loop(idle_timeout=2.0):
 
     next_nod_time = None
 
+    nod_up = True
+
     while True:
         now = time.time()
 
@@ -155,9 +157,13 @@ def nod_loop(idle_timeout=2.0):
             continue
 
         if now >= next_nod_time:
-            print(f"[NOD] ~{bpm:.1f} BPM")  # simple text cue
-            # For real robot later, you can do:
-            # shimon_nod()
+            print(f"[NOD] ~{bpm:.1f} BPM")  # simple text 
+            if nod_up:
+                send_gesture_to_shimon("NECK", 0.1, 10)
+                nod_up = False
+            else:
+                send_gesture_to_shimon("NECK", -0.1, 10)
+                nod_up = True
 
             # Re-read bpm each time so nod spacing adapts if tempo changed
             with nod_bpm_lock:

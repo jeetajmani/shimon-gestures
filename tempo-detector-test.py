@@ -88,6 +88,7 @@ def nod_loop(idle_timeout=2.0):
     global nod_bpm, last_event_ts
 
     next_nod_time = None
+    nod_up = True
 
     while True:
         now = time.time()
@@ -115,8 +116,14 @@ def nod_loop(idle_timeout=2.0):
             continue
 
         if now >= next_nod_time:
-            print(f"[NOD] ~{bpm:.1f} BPM")
-            # In the real robot code you would call: shimon_nod()
+            if nod_up:
+                print(f"[NOD] ~{bpm:.1f} BPM (up)")
+                # In the real robot code you would call: shimon_nod_up()
+                nod_up = False
+            else:
+                print(f"[NOD] ~{bpm:.1f} BPM (down)")
+                # In the real robot code you would call: shimon_nod()
+                nod_up = True
 
             # Re-read bpm each time so nod spacing adapts if tempo changed
             with nod_bpm_lock:
